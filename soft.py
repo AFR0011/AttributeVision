@@ -1,6 +1,4 @@
 import os
-import asyncio
-import platform
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,8 +8,18 @@ from PIL import Image
 import torchvision.transforms as transforms
 import torchvision.models as models
 from typing import List, Tuple, Dict
-# Note: pykan library is not available in Pyodide; included as placeholder for KAN implementation
-# For actual KAN, use https://github.com/KindXiaoming/pykan outside Pyodide
+from sklearn.metrics import f1_score
+from itertools import product
+from datetime import datetime
+
+# --- Custom Collate Function ---
+
+def custom_collate(batch):
+    # Filter out None items
+    batch = [item for item in batch if item is not None]
+    if len(batch) < 8:  # Minimum batch size
+        return None
+    return torch.utils.data.default_collate(batch)
 
 # --- Dataset Classes ---
 
@@ -21,42 +29,113 @@ class PETADataset(Dataset):
         self.transform = transform
         self.image_paths = []
         self.labels = []
-        self.num_attributes = 65  # PETA has 65 attributes
+        self.num_binary_attributes = 61
+        self.colors = ['Black', 'Blue', 'Brown', 'Green', 'Grey', 'Orange', 'Pink', 'Purple', 'Red', 'White', 'Yellow']
+        self.color_categories = ['upperBody', 'lowerBody', 'hair', 'footwear']
+        self.num_color_attributes = len(self.color_categories) * len(self.colors)  # 4 * 11 = 44
+        self.num_total_attributes = self.num_binary_attributes + self.num_color_attributes  # 61 + 44 = 105
 
-        # Load images and labels from 10 folders
-        for folder in os.listdir(root_dir):
-            folder_path = os.path.join(root_dir, folder)
-            if not os.path.isdir(folder_path):
-                continue
-            label_file = os.path.join(folder_path, "Label.txt")
-            if not os.path.exists(label_file):
-                continue
+        # Binary attribute mapping (name to index)
+        self.binary_attr_map = {
+            'accessoryHeadphone': 0, 'personalLess15': 1, 'personalLess30': 2, 'personalLess45': 3,
+            'personalLess60': 4, 'personalLarger60': 5, 'carryingBabyBuggy': 6, 'carryingBackpack': 7,
+            'hairBald': 8, 'footwearBoots': 9, 'lowerBodyCapri': 10, 'carryingOther': 11,
+            'carryingShoppingTro': 12, 'carryingUmbrella': 13, 'lowerBodyCasual': 14, 'upperBodyCasual': 15,
+            'personalFemale': 16, 'carryingFolder': 17, 'lowerBodyFormal': 18, 'upperBodyFormal': 19,
+            'accessoryHairBand': 20, 'accessoryHat': 21, 'lowerBodyHotPants': 22, 'upperBodyJacket': 23,
+            'lowerBodyJeans': 24, 'accessoryKerchief': 25, 'footwearLeatherShoes': 26, 'upperBodyLogo': 27,
+            'hairLong': 28, 'lowerBodyLongSkirt': 29, 'upperBodyLongSleeve': 30, 'lowerBodyPlaid': 31,
+            'lowerBodyThinStripes': 32, 'carryingLuggageCase': 33, 'personalMale': 34,
+            'carryingMessengerBag': 35, 'accessoryMuffler': 36, 'accessoryNothing': 37,
+            'carryingNothing': 38, 'upperBodyNoSleeve': 39, 'upperBodyPlaid': 40, 'carryingPlasticBags': 41,
+            'footwearSandals': 42, 'footwearShoes': 43, 'hairShort': 44, 'lowerBodyShorts': 45,
+            'upperBodyShortSleeve': 46, 'lowerBodyShortSkirt': 47, 'footwearSneakers': 48,
+            'footwearStocking': 49, 'upperBodyThinStripes': 50, 'upperBodySuit': 51,
+            'carryingSuitcase': 52, 'lowerBodySuits': 53, 'accessorySunglasses': 54, 'upperBodySweater': 55,
+            'upperBodyThickStripes': 56, 'lowerBodyTrousers': 57, 'upperBodyTshirt': 58,
+            'upperBodyOther': 59, 'upperBodyVNeck': 60
+        }
+        # Color attribute mapping (category_color to index)
+        self.color_attr_map = {}
+        idx = 0
+        for category in self.color_categories:
+            for color in self.colors:
+                self.color_attr_map[f"{category}{color}"] = idx
+                idx += 1
 
-            # Read Label.txt: image_name label1 label2 ...
-            with open(label_file, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) < self.num_attributes + 1:
-                        continue
-                    image_name = parts[0]
-                    image_path = os.path.join(folder_path, image_name)
-                    if not os.path.exists(image_path):
-                        continue
-                    # Convert labels to binary (0/1)
-                    label = [int(x) for x in parts[1:self.num_attributes + 1]]
-                    self.image_paths.append(image_path)
-                    self.labels.append(label)
+        # Load from TownCentre folder only
+        folder_path = os.path.join(root_dir, "TownCentre")
+        print(f"Checking folder: {folder_path}")
+        if not os.path.isdir(folder_path):
+            print(f"Error: TownCentre folder not found at {folder_path}")
+            return
+
+        label_file = os.path.join(folder_path, "Label.txt")
+        print(f"Checking labels file: {label_file}")
+        if not os.path.exists(label_file):
+            print(f"Error: Label.txt not found at {label_file}")
+            return
+
+        # Log folder contents
+        print(f"Files in TownCentre: {os.listdir(folder_path)}")
+
+        # Read Label.txt: image_name attr1 attr2 ...
+        valid_lines = 0
+        skipped_lines = 0
+        with open(label_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:  # Need at least ID + one attribute
+                    print(f"Skipping line (too short): {line.strip()}")
+                    skipped_lines += 1
+                    continue
+                image_name = parts[0]
+                # Find all image files starting with <image_name>_
+                matching_images = [
+                    os.path.join(folder_path, filename)
+                    for filename in os.listdir(folder_path)
+                    if filename.startswith(f"{image_name}_") and filename.lower().endswith(('.jpg', '.jpeg', '.png'))
+                ]
+                if not matching_images:
+                    print(f"Skipping line (no images found for {image_name}_): {line.strip()}")
+                    skipped_lines += 1
+                    continue
+                try:
+                    binary_labels = [0] * self.num_binary_attributes
+                    color_labels = [0] * self.num_color_attributes
+                    for attr in parts[1:]:
+                        if attr in self.binary_attr_map:
+                            binary_labels[self.binary_attr_map[attr]] = 1
+                        elif self.color_attr_map and attr in self.color_attr_map:
+                            color_labels[self.color_attr_map[attr]] = 1
+                        else:
+                            print(f"Warning: Unknown attribute {attr} in {label_file}")
+                    # Add each matching image with the same labels
+                    for image_path in matching_images:
+                        self.image_paths.append(image_path)
+                        self.labels.append(binary_labels + color_labels)
+                    print(f"Found {len(matching_images)} images for ID {image_name}")
+                    valid_lines += 1
+                except Exception as e:
+                    print(f"Skipping invalid line in {label_file}: {line.strip()} (Error: {e})")
+                    skipped_lines += 1
+        print(f"Processed {valid_lines} valid lines, skipped {skipped_lines} lines")
+        print(f"Total images loaded: {len(self.image_paths)}")
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         img_path = self.image_paths[idx]
-        label = torch.tensor(self.labels[idx], dtype=torch.float32)
-        image = Image.open(img_path).convert('RGB')
+        labels = torch.tensor(self.labels[idx], dtype=torch.float32)
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Skipping corrupted image: {img_path} (Error: {e})")
+            return None
         if self.transform:
             image = self.transform(image)
-        return image, label
+        return image, labels
 
 class UTKFaceDataset(Dataset):
     def __init__(self, root_dir: str, transform=None):
@@ -88,11 +167,15 @@ class UTKFaceDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         img_path = self.image_paths[idx]
         age, gender, race = self.labels[idx]
-        image = Image.open(img_path).convert('RGB')
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Skipping corrupted image: {img_path}")
+            return None
         if self.transform:
             image = self.transform(image)
         labels = {
-            'age': torch.tensor(age, dtype=torch.float32),
+            'age': torch.tensor(age / 116.0, dtype=torch.float32),  # Normalize to [0, 1]
             'gender': torch.tensor(gender, dtype=torch.long),
             'race': torch.tensor(race, dtype=torch.long)
         }
@@ -100,85 +183,69 @@ class UTKFaceDataset(Dataset):
 
 # --- Data Preprocessing ---
 
-def get_transforms(dataset: str):
+def get_transforms(dataset: str, is_training: bool = True):
     if dataset == 'PETA':
-        return transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.RandomCrop(227),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        if is_training:
+            return transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            return transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
     elif dataset == 'UTKFace':
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.RandomRotation(10),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        if is_training:
+            return transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            return transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
 # --- Model Definitions ---
 
-class KANLayer(nn.Module):
-    # Simplified KAN implementation (placeholder; use pykan for full version)
-    def __init__(self, in_features: int, out_features: int):
-        super(KANLayer, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
-        self.activation = nn.SiLU()  # Sigmoid-weighted linear unit
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear(x)
-        return self.activation(x)
-
-class CNNKAN(nn.Module):
-    def __init__(self, num_attributes: int = 65, is_utkface: bool = False):
-        super(CNNKAN, self).__init__()
-        self.is_utkface = is_utkface
-        # CNN backbone (ResNet-50)
-        self.backbone = models.resnet50(pretrained=True)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Identity()  # Remove final FC layer
-
-        # KAN head
-        self.kan = nn.Sequential(
-            KANLayer(in_features, 512),
-            KANLayer(512, 256),
-            KANLayer(256, num_attributes if not is_utkface else 512)
-        )
-
-        if is_utkface:
-            # UTKFace heads: age (regression), gender (binary), race (5-class)
-            self.age_head = nn.Linear(512, 1)
-            self.gender_head = nn.Linear(512, 2)
-            self.race_head = nn.Linear(512, 5)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor or Dict[str, torch.Tensor]:
-        features = self.backbone(x)
-        features = self.kan(features)
-        if self.is_utkface:
-            return {
-                'age': self.age_head(features).squeeze(-1),
-                'gender': self.gender_head(features),
-                'race': self.race_head(features)
-            }
-        return torch.sigmoid(features)  # PETA: multi-label
-
 class CNNMobileNet(nn.Module):
-    def __init__(self, num_attributes: int = 65, is_utkface: bool = False):
+    def __init__(self, num_attributes: int = 105, is_utkface: bool = False, dropout_rate: float = 0.5):
         super(CNNMobileNet, self).__init__()
         self.is_utkface = is_utkface
-        # MobileNetV3 backbone
-        self.backbone = models.mobilenet_v3_small(pretrained=True)
-        in_features = self.backbone.classifier[3].in_features
+        self.backbone = models.mobilenet_v3_small(weights='IMAGENET1K_V1')
         self.backbone.classifier = nn.Identity()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
-        # Custom CNN head
+        # Compute actual in_features from backbone output
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 224, 224)
+            dummy_features = self.backbone(dummy_input)
+            if len(dummy_features.shape) == 4:  # [batch, channels, H, W]
+                dummy_features = nn.AdaptiveAvgPool2d(1)(dummy_features)
+                dummy_features = dummy_features.flatten(1)
+            elif len(dummy_features.shape) == 2:  # [batch, channels]
+                pass  # Already pooled
+            else:
+                raise ValueError(f"Unexpected backbone output shape: {dummy_features.shape}")
+            in_features = dummy_features.shape[1]
+
+        # Adjust cnn_head based on backbone output
         self.cnn_head = nn.Sequential(
-            nn.Conv2d(in_features, 512, kernel_size=1),
+            nn.Linear(in_features, 512),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
+            nn.Dropout(dropout_rate)
         )
 
         if is_utkface:
@@ -186,11 +253,65 @@ class CNNMobileNet(nn.Module):
             self.gender_head = nn.Linear(512, 2)
             self.race_head = nn.Linear(512, 5)
         else:
-            self.head = nn.Linear(512, num_attributes)
+            self.head = nn.Linear(512, num_attributes)  # 61 binary + 44 color attributes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor or Dict[str, torch.Tensor]:
         features = self.backbone(x)
+        if len(features.shape) == 4:  # [batch, channels, H, W]
+            features = nn.AdaptiveAvgPool2d(1)(features)
+            features = features.flatten(1)
+        elif len(features.shape) == 2:  # [batch, channels]
+            pass  # Already pooled
+        else:
+            raise ValueError(f"Unexpected backbone output shape: {features.shape}")
         features = self.cnn_head(features)
+        if self.is_utkface:
+            return {
+                'age': self.age_head(features).squeeze(-1),
+                'gender': self.gender_head(features),
+                'race': self.race_head(features)
+            }
+        output = torch.sigmoid(self.head(features))
+        return output
+
+class MLCNN(nn.Module):
+    def __init__(self, num_attributes: int = 105, is_utkface: bool = False, dropout_rate: float = 0.5):
+        super(MLCNN, self).__init__()
+        self.is_utkface = is_utkface
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Dropout(dropout_rate)
+        )
+        dummy_input = torch.zeros(1, 3, 224, 224)
+        in_features = self.backbone(dummy_input).shape[1]
+        self.fc = nn.Linear(in_features, 512)
+        self.fc_relu = nn.ReLU()
+        self.fc_dropout = nn.Dropout(dropout_rate)
+
+        if is_utkface:
+            self.age_head = nn.Linear(512, 1)
+            self.gender_head = nn.Linear(512, 2)
+            self.race_head = nn.Linear(512, 5)
+        else:
+            self.head = nn.Linear(512, num_attributes)  # 61 binary + 44 color attributes
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor or Dict[str, torch.Tensor]:
+        features = self.backbone(x)
+        features = self.fc(features)
+        features = self.fc_relu(features)
+        features = self.fc_dropout(features)
         if self.is_utkface:
             return {
                 'age': self.age_head(features).squeeze(-1),
@@ -199,64 +320,31 @@ class CNNMobileNet(nn.Module):
             }
         return torch.sigmoid(self.head(features))
 
-class MLCNN(nn.Module):
-    def __init__(self, num_attributes: int = 65, is_utkface: bool = False):
-        super(MLCNN, self).__init__()
-        self.is_utkface = is_utkface
-        # Simple CNN (placeholder; extend with 5-7 conv layers as in OpenPAR)
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Flatten()
-        )
-        # TODO: Compute in_features based on input size
-        self.fc = nn.Linear(128 * 56 * 56, num_attributes if not is_utkface else 512)
-        if is_utkface:
-            self.age_head = nn.Linear(512, 1)
-            self.gender_head = nn.Linear(512, 2)
-            self.race_head = nn.Linear(512, 5)
+# --- Training and Evaluation Functions ---
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor or Dict[str, torch.Tensor]:
-        features = self.backbone(x)
-        features = self.fc(features)
-        if self.is_utkface:
-            return {
-                'age': self.age_head(features).squeeze(-1),
-                'gender': self.gender_head(features),
-                'race': self.race_head(features)
-            }
-        return torch.sigmoid(features)
-
-class CLIPPAR(nn.Module):
-    def __init__(self, num_attributes: int = 65, is_utkface: bool = False):
-        super(CLIPPAR, self).__init__()
-        # Placeholder: Use Hugging Face CLIP (requires external library)
-        # TODO: Load CLIP-ViT-B/32, add prompt module
-        raise NotImplementedError("CLIP-PAR requires Hugging Face Transformers")
-
-class MTANet(nn.Module):
-    def __init__(self, num_attributes: int = 65, is_utkface: bool = False):
-        super(MTANet, self).__init__()
-        # Placeholder: Implement multi-step attention
-        # TODO: Use ResNet-50 backbone, add attention module
-        raise NotImplementedError("MTA-Net requires custom attention implementation")
-
-# --- Training Functions ---
-
-def train_peta(model, train_loader, val_loader, epochs: int = 10):
+def train_peta(model, train_loader, val_loader, epochs: int = 10, model_name: str = 'model', lr: float = 0.001, optimizer_type: str = 'Adam'):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.BCELoss()  # Binary cross-entropy for multi-label
+    if optimizer_type == 'Adam':
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_type == 'SGD':
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_type}")
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+    criterion = nn.BCELoss()
+    best_val_loss = float('inf')
+    patience = 5
+    counter = 0
 
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for images, labels in train_loader:
+        for i, batch in enumerate(train_loader):
+            if batch is None:
+                print(f"Batch {i} is None, skipping")
+                continue
+            images, labels = batch
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(images)
@@ -266,103 +354,295 @@ def train_peta(model, train_loader, val_loader, epochs: int = 10):
             train_loss += loss.item()
         print(f"Epoch {epoch+1}, Train Loss: {train_loss/len(train_loader)}")
 
-        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for images, labels in val_loader:
+            for batch in val_loader:
+                if batch is None:
+                    continue
+                images, labels = batch
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
-        print(f"Validation Loss: {val_loss/len(val_loader)}")
+        val_loss /= len(val_loader)
+        print(f"Validation Loss: {val_loss}")
+        scheduler.step(val_loss)
 
-def train_utkface(model, train_loader, val_loader, epochs: int = 10):
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            torch.save(model.state_dict(), f"best_{model_name}_peta.pt")
+        else:
+            counter += 1
+            if counter >= patience:
+                print("Early stopping")
+                break
+    return best_val_loss
+
+def train_utkface(model, train_loader, val_loader, epochs: int = 10, model_name: str = 'model', lr: float = 0.001, optimizer_type: str = 'Adam'):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    age_criterion = nn.MSELoss()  # Regression for age
+    if optimizer_type == 'Adam':
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_type == 'SGD':
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_type}")
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+    age_criterion = nn.MSELoss()
     gender_criterion = nn.CrossEntropyLoss()
     race_criterion = nn.CrossEntropyLoss()
+    best_val_loss = float('inf')
+    patience = 5
+    counter = 0
 
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for images, labels in train_loader:
+        for batch in train_loader:
+            if batch is None:
+                continue
+            images, labels = batch
             images = images.to(device)
-            age, gender, race = labels['age'].to(device), labels['gender'].to(device), labels['race'].to(device)
+            labels = {k: v.to(device) for k, v in labels.items()}
             optimizer.zero_grad()
             outputs = model(images)
-            age_loss = age_criterion(outputs['age'], age)
-            gender_loss = gender_criterion(outputs['gender'], gender)
-            race_loss = race_criterion(outputs['race'], race)
-            loss = age_loss + gender_loss + race_loss
+            age_loss = age_criterion(outputs['age'], labels['age'])
+            gender_loss = gender_criterion(outputs['gender'], labels['gender'])
+            race_loss = race_criterion(outputs['race'], labels['race'])
+            loss = 0.1 * age_loss + gender_loss + race_loss
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
         print(f"Epoch {epoch+1}, Train Loss: {train_loss/len(train_loader)}")
 
-        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for images, labels in val_loader:
+            for batch in val_loader:
+                if batch is None:
+                    continue
+                images, labels = batch
                 images = images.to(device)
-                age, gender, race = labels['age'].to(device), labels['gender'].to(device), labels['race'].to(device)
+                labels = {k: v.to(device) for k, v in labels.items()}
                 outputs = model(images)
-                age_loss = age_criterion(outputs['age'], age)
-                gender_loss = gender_criterion(outputs['gender'], gender)
-                race_loss = race_criterion(outputs['race'], race)
-                loss = age_loss + gender_loss + race_loss
+                age_loss = age_criterion(outputs['age'], labels['age'])
+                gender_loss = gender_criterion(outputs['gender'], labels['gender'])
+                race_loss = race_criterion(outputs['race'], labels['race'])
+                loss = 0.1 * age_loss + gender_loss + race_loss
                 val_loss += loss.item()
-        print(f"Validation Loss: {val_loss/len(val_loader)}")
+        val_loss /= len(val_loader)
+        print(f"Validation Loss: {val_loss}")
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            torch.save(model.state_dict(), f"best_{model_name}_utkface.pt")
+        else:
+            counter += 1
+            if counter >= patience:
+                print("Early stopping")
+                break
+    return best_val_loss
+
+def evaluate_peta(model, loader, model_name: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    preds, labels = [], []
+    colors = ['Black', 'Blue', 'Brown', 'Green', 'Grey', 'Orange', 'Pink', 'Purple', 'Red', 'White', 'Yellow']
+    color_categories = ['upperBody', 'lowerBody', 'hair', 'footwear']
+    num_binary = 61
+    num_colors = len(colors) * len(color_categories)
+    with torch.no_grad():
+        for batch in loader:
+            if batch is None:
+                continue
+            images, lbls = batch
+            images, lbls = images.to(device), lbls.to(device)
+            outputs = model(images)
+            preds.append((outputs > 0.5).float().cpu().numpy())
+            labels.append(lbls.cpu().numpy())
+    preds = np.concatenate(preds)
+    labels = np.concatenate(labels)
+    binary_preds = preds[:, :num_binary]
+    binary_labels = labels[:, :num_binary]
+    color_preds = preds[:, num_binary:]
+    color_labels = labels[:, num_binary:]
+    metrics = {
+        'f1_binary': f1_score(binary_labels, binary_preds, average='micro')
+    }
+    for i, category in enumerate(color_categories):
+        start_idx = i * len(colors)
+        end_idx = (i + 1) * len(colors)
+        cat_preds = color_preds[:, start_idx:end_idx]
+        cat_labels = color_labels[:, start_idx:end_idx]
+        metrics[f'{category}_acc'] = f1_score(cat_labels, cat_preds, average='micro')
+    return metrics
+
+def evaluate_utkface(model, loader, model_name: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    age_errors, gender_preds, gender_labels, race_preds, race_labels = [], [], [], [], []
+    with torch.no_grad():
+        for batch in loader:
+            if batch is None:
+                continue
+            images, labels = batch
+            images = images.to(device)
+            outputs = model(images)
+            age_errors.append(torch.abs(outputs['age'] - labels['age'].to(device)).cpu().numpy())
+            gender_preds.append(torch.argmax(outputs['gender'], dim=1).cpu().numpy())
+            gender_labels.append(labels['gender'].cpu().numpy())
+            race_preds.append(torch.argmax(outputs['race'], dim=1).cpu().numpy())
+            race_labels.append(labels['race'].cpu().numpy())
+    age_mae = np.concatenate(age_errors).mean() * 116.0
+    gender_acc = (np.concatenate(gender_preds) == np.concatenate(gender_labels)).mean()
+    race_acc = (np.concatenate(race_preds) == np.concatenate(race_labels)).mean()
+    metrics = {
+        'age_mae': age_mae,
+        'gender_acc': gender_acc,
+        'race_acc': race_acc
+    }
+    return metrics
 
 # --- Main Execution ---
 
-async def main():
-    # Dataset paths
+def main():
     peta_root = "./Datasets/PETA"
     utkface_root = "./Datasets/UTK"
 
-    # Load datasets
-    peta_train_dataset = PETADataset(peta_root, transform=get_transforms('PETA'))
-    utkface_train_dataset = UTKFaceDataset(utkface_root, transform=get_transforms('UTKFace'))
+    print(f"Current working directory: {os.getcwd()}")
+    peta_train_dataset = PETADataset(peta_root, transform=get_transforms('PETA', is_training=True))
+    peta_val_dataset = PETADataset(peta_root, transform=get_transforms('PETA', is_training=False))
+    print(f"PETA dataset size: {len(peta_train_dataset)}")
 
-    # Split datasets (80% train, 20% val for simplicity)
+    if len(peta_train_dataset) == 0:
+        raise ValueError("PETA dataset is empty. Check TownCentre folder and Label.txt.")
+
+    utkface_train_dataset = UTKFaceDataset(utkface_root, transform=get_transforms('UTKFace', is_training=True))
+    utkface_val_dataset = UTKFaceDataset(utkface_root, transform=get_transforms('UTKFace', is_training=False))
+    print(f"UTKFace dataset size: {len(utkface_train_dataset)}")
+
+    if len(utkface_train_dataset) == 0:
+        raise ValueError("UTKFace dataset is empty. Check UTK folder.")
+
     peta_train_size = int(0.8 * len(peta_train_dataset))
     peta_val_size = len(peta_train_dataset) - peta_train_size
+    print(f"PETA train size: {peta_train_size}, PETA val size: {peta_val_size}")
     peta_train_dataset, peta_val_dataset = torch.utils.data.random_split(
         peta_train_dataset, [peta_train_size, peta_val_size])
 
     utkface_train_size = int(0.8 * len(utkface_train_dataset))
     utkface_val_size = len(utkface_train_dataset) - utkface_train_size
+    print(f"UTKFace train size: {utkface_train_size}, UTKFace val size: {utkface_val_size}")
     utkface_train_dataset, utkface_val_dataset = torch.utils.data.random_split(
         utkface_train_dataset, [utkface_train_size, utkface_val_size])
 
-    # DataLoaders
-    peta_train_loader = DataLoader(peta_train_dataset, batch_size=32, shuffle=True)
-    peta_val_loader = DataLoader(peta_val_dataset, batch_size=32)
-    utkface_train_loader = DataLoader(utkface_train_dataset, batch_size=32, shuffle=True)
-    utkface_val_loader = DataLoader(utkface_val_dataset, batch_size=32)
-
-    # Initialize models
+    # Hyperparameter search for both PETA and UTKFace
+    learning_rates = [0.01, 0.001, 0.0001]
+    batch_sizes = [8, 16, 32]
+    dropout_rates = [0.3, 0.5]
+    optimizers = ['Adam', 'SGD']
     models_to_test = [
-        ('CNN+KAN', CNNKAN(num_attributes=65, is_utkface=False), CNNKAN(is_utkface=True)),
-        ('CNN+MobileNet', CNNMobileNet(num_attributes=65, is_utkface=False), CNNMobileNet(is_utkface=True)),
-        ('MLCNN', MLCNN(num_attributes=65, is_utkface=False), MLCNN(is_utkface=True)),
-        ('CLIP-PAR', CLIPPAR(num_attributes=65, is_utkface=False), CLIPPAR(is_utkface=True)),
-        ('MTA-Net', MTANet(num_attributes=65, is_utkface=False), MTANet(is_utkface=True))
+        ('CNN+MobileNet', CNNMobileNet),
+        ('MLCNN', MLCNN)
     ]
 
-    # Train models
-    for name, peta_model, utkface_model in models_to_test:
-        print(f"\nTraining {name} on PETA...")
-        train_peta(peta_model, peta_train_loader, peta_val_loader, epochs=5)
-        print(f"\nTraining {name} on UTKFace...")
-        train_utkface(utkface_model, utkface_train_loader, utkface_val_loader, epochs=5)
+    results_file = 'hyperparameter_results.txt'
+    with open(results_file, 'a') as f:
+        f.write(f"\n=== Hyperparameter Search Started at {datetime.now()} ===\n")
 
-# Run in Pyodide environment
-if platform.system() == "Emscripten":
-    asyncio.ensure_future(main())
-else:
-    asyncio.run(main())
+    # PETA Hyperparameter Search
+    for model_name, model_class in models_to_test:
+        print(f"\nHyperparameter search for {model_name} on PETA...")
+        for lr, batch_size, dropout_rate, optimizer_type in product(learning_rates, batch_sizes, dropout_rates, optimizers):
+            print(f"\nTesting: lr={lr}, batch_size={batch_size}, dropout_rate={dropout_rate}, optimizer={optimizer_type}")
+            
+            # Create DataLoaders with current batch size
+            peta_train_loader = DataLoader(peta_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True)
+            peta_val_loader = DataLoader(peta_val_dataset, batch_size=batch_size, collate_fn=custom_collate, drop_last=True)
+
+            # Initialize model with current dropout rate
+            peta_model = model_class(num_attributes=105, is_utkface=False, dropout_rate=dropout_rate)
+            
+            # Train model
+            best_val_loss = train_peta(
+                peta_model, 
+                peta_train_loader, 
+                peta_val_loader, 
+                epochs=5, 
+                model_name=f"{model_name}_lr{lr}_bs{batch_size}_dr{dropout_rate}_{optimizer_type}",
+                lr=lr,
+                optimizer_type=optimizer_type
+            )
+            
+            # Evaluate model
+            peta_metrics = evaluate_peta(peta_model, peta_val_loader, model_name)
+            
+            # Log results to file
+            with open(results_file, 'a') as f:
+                f.write(f"\nRun at {datetime.now()}\n")
+                f.write(f"Dataset: PETA\n")
+                f.write(f"Model: {model_name}\n")
+                f.write(f"Hyperparameters:\n")
+                f.write(f"  Learning Rate: {lr}\n")
+                f.write(f"  Batch Size: {batch_size}\n")
+                f.write(f"  Dropout Rate: {dropout_rate}\n")
+                f.write(f"  Optimizer: {optimizer_type}\n")
+                f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
+                f.write(f"Evaluation Metrics:\n")
+                for metric, value in peta_metrics.items():
+                    f.write(f"  {metric}: {value:.6f}\n")
+                f.write("-" * 50 + "\n")
+            
+            print(f"Results saved: Best Val Loss={best_val_loss:.6f}, Metrics={peta_metrics}")
+
+    # UTKFace Hyperparameter Search
+    for model_name, model_class in models_to_test:
+        print(f"\nHyperparameter search for {model_name} on UTKFace...")
+        for lr, batch_size, dropout_rate, optimizer_type in product(learning_rates, batch_sizes, dropout_rates, optimizers):
+            print(f"\nTesting: lr={lr}, batch_size={batch_size}, dropout_rate={dropout_rate}, optimizer={optimizer_type}")
+            
+            # Create DataLoaders with current batch size
+            utkface_train_loader = DataLoader(utkface_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True)
+            utkface_val_loader = DataLoader(utkface_val_dataset, batch_size=batch_size, collate_fn=custom_collate, drop_last=True)
+
+            # Initialize model with current dropout rate
+            utkface_model = model_class(is_utkface=True, dropout_rate=dropout_rate)
+            
+            # Train model
+            best_val_loss = train_utkface(
+                utkface_model, 
+                utkface_train_loader, 
+                utkface_val_loader, 
+                epochs=5, 
+                model_name=f"{model_name}_lr{lr}_bs{batch_size}_dr{dropout_rate}_{optimizer_type}",
+                lr=lr,
+                optimizer_type=optimizer_type
+            )
+            
+            # Evaluate model
+            utkface_metrics = evaluate_utkface(utkface_model, utkface_val_loader, model_name)
+            
+            # Log results to file
+            with open(results_file, 'a') as f:
+                f.write(f"\nRun at {datetime.now()}\n")
+                f.write(f"Dataset: UTKFace\n")
+                f.write(f"Model: {model_name}\n")
+                f.write(f"Hyperparameters:\n")
+                f.write(f"  Learning Rate: {lr}\n")
+                f.write(f"  Batch Size: {batch_size}\n")
+                f.write(f"  Dropout Rate: {dropout_rate}\n")
+                f.write(f"  Optimizer: {optimizer_type}\n")
+                f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
+                f.write(f"Evaluation Metrics:\n")
+                for metric, value in utkface_metrics.items():
+                    f.write(f"  {metric}: {value:.6f}\n")
+                f.write("-" * 50 + "\n")
+            
+            print(f"Results saved: Best Val Loss={best_val_loss:.6f}, Metrics={utkface_metrics}")
+
+if __name__ == "__main__":
+    main()
