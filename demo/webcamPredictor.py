@@ -8,7 +8,7 @@ from typing import Dict
 import time
 from torch.amp import autocast
 
-# --- Model Definition (Copied from Your Code) ---
+# --- Model Definition ---
 class CNNMobileNet(nn.Module):
     def __init__(self, num_attributes: int = 105, is_utkface: bool = False, dropout_rate: float = 0.5):
         super(CNNMobileNet, self).__init__()
@@ -83,12 +83,12 @@ def predict(model, image: np.ndarray, transform, device: torch.device) -> Dict[s
         outputs = model(image_tensor)
     
     # Process outputs
-    age = outputs['age'].item() * 116.0  # Denormalize age
+    age = outputs['age'].item() * 116.0
     gender = torch.argmax(outputs['gender'], dim=1).item()
     race = torch.argmax(outputs['race'], dim=1).item()
     
     gender_label = 'Male' if gender == 0 else 'Female'
-    race_labels = ['White', 'Black', 'Asian', 'Indian', 'Other']  # Adjust based on UTKFace
+    race_labels = ['White', 'Black', 'Asian', 'Indian', 'Other']
     race_label = race_labels[race]
     
     return {
@@ -97,16 +97,15 @@ def predict(model, image: np.ndarray, transform, device: torch.device) -> Dict[s
         'race': race_label
     }
 
-# --- Main Webcam Inference Loop ---
 def main():
     # Configuration
-    model_path = "models/best_CNN+MobileNet_lr0.001_bs64_dr0.2_wd0.0001_Adam_utkface.pt"  # Update with your model path
+    model_path = "models/best_CNN+MobileNet_lr0.001_bs64_dr0.2_wd0.0001_Adam_-3_utkface.pt"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     update_interval = 1.0  # Update predictions every 1 second
     print(f"Using device: {device}")
 
     # Load model
-    model = CNNMobileNet(is_utkface=True, dropout_rate=0.3)  # Match dropout_rate from model_id
+    model = CNNMobileNet(is_utkface=True, dropout_rate=0.2)
     try:
         state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
