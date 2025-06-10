@@ -1,3 +1,39 @@
+"""
+Project: Hyperparameter Optimization for Multi-Attribute Classification for PETA and UTKFace Datasets
+Author: Ali Farrokhnejad
+Description:
+    This script implements a multi-attribute classification framework for two datasets:
+    - PETA (Pedestrian Attribute) dataset: Classifies pedestrian attributes (binary and color-based)
+    - UTKFace dataset: Predicts age (regression), gender, and race (classification)
+    
+    Key Components:
+    1. Custom Dataset Classes:
+       - PETADataset: Loads and processes PETA images and multi-label attributes
+       - UTKFaceDataset: Loads and processes UTKFace images with age, gender, and race labels
+    2. Data Preprocessing:
+       - Image transformations (resize, flip, rotation, normalization)
+       - Custom collate function for batch processing
+    3. Models:
+       - CNNMobileNet: MobileNetV3-based model for feature extraction and classification
+       - MLCNN: Custom multi-layer CNN with configurable layers and units
+    4. Training:
+       - Hyperparameter search (learning rate, batch size, dropout, weight decay)
+       - Mixed precision training with GradScaler
+       - Early stopping and learning rate scheduling
+    5. Evaluation:
+       - PETA: F1 scores for binary and color attributes
+       - UTKFace: MAE for age, accuracy for gender and race
+    6. Main Execution:
+       - Trains and evaluates models on both datasets with various hyperparameters
+       - Saves results and best models
+
+Dependencies:
+    - Python 3.x
+    - PyTorch, Torchvision
+    - NumPy
+    - PIL (Pillow)
+    - scikit-learn
+"""
 import os
 import numpy as np
 import torch
@@ -11,8 +47,7 @@ from typing import List, Tuple, Dict
 from sklearn.metrics import f1_score
 from itertools import product
 from datetime import datetime
-from torch.amp import autocast, GradScaler  # Added for mixed precision
-
+from torch.amp import autocast, GradScaler 
 
 # --- Custom Collate Function ---
 def custom_collate(batch):
@@ -287,7 +322,7 @@ class CNNMobileNet(nn.Module):
         self.is_utkface = is_utkface
         self.backbone = models.mobilenet_v3_small(weights="IMAGENET1K_V1")
         self.backbone.classifier = nn.Identity()
-        # Unfreeze last block (features[-1]) to fine-tune further
+        # Unfreeze last 3 blocks to fine-tune
         for param in self.backbone.features[-3].parameters():
             param.requires_grad = True
 
@@ -423,7 +458,7 @@ def train_peta(
     )
 
     criterion = nn.BCEWithLogitsLoss().to(device)
-    scaler = GradScaler()  # For mixed precision
+    scaler = GradScaler() 
     torch.cuda.empty_cache()
     best_val_loss = float("inf")
     patience = 10
@@ -439,7 +474,7 @@ def train_peta(
             images, labels = batch
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
-            with autocast("cuda"):  # Mixed precision
+            with autocast("cuda"): 
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -459,7 +494,7 @@ def train_peta(
                     continue
                 images, labels = batch
                 images, labels = images.to(device), labels.to(device)
-                with autocast("cuda"):  # Optional for validation
+                with autocast("cuda"):  # Optional mixed percision
                     outputs = model(images)
                     loss = criterion(outputs, labels)
                 val_loss += loss.item()
@@ -535,7 +570,7 @@ def train_utkface(
     age_criterion = nn.MSELoss().to(device)
     gender_criterion = nn.CrossEntropyLoss().to(device)
     race_criterion = nn.CrossEntropyLoss().to(device)
-    scaler = GradScaler()  # For mixed precision
+    scaler = GradScaler() 
     torch.cuda.empty_cache()
     best_val_loss = float("inf")
     patience = 50
@@ -552,7 +587,7 @@ def train_utkface(
             images = images.to(device)
             labels = {k: v.to(device) for k, v in labels.items()}
             optimizer.zero_grad()
-            with autocast("cuda"):  # Mixed precision
+            with autocast("cuda"): 
                 outputs = model(images)
                 age_loss = age_criterion(outputs["age"], labels["age"])
                 gender_loss = gender_criterion(outputs["gender"], labels["gender"])
@@ -584,7 +619,7 @@ def train_utkface(
                 images, labels = batch
                 images = images.to(device)
                 labels = {k: v.to(device) for k, v in labels.items()}
-                with autocast("cuda"):  # Optional for validation
+                with autocast("cuda"):  # Optional mixed precision
                     outputs = model(images)
                     age_loss = age_criterion(outputs["age"], labels["age"])
                     gender_loss = gender_criterion(outputs["gender"], labels["gender"])
@@ -747,10 +782,10 @@ def main():
         utkface_train_dataset, [utkface_train_size, utkface_val_size]
     )
 
-    learning_rates = [0.001] # 0.01, 0.005, 0.0001
-    batch_sizes = [64] # 32, 16, 8, 4
-    dropout_rates = [0.2] # 0.3, 0.5
-    weight_decays = [0.0001] # 0, 0.001
+    learning_rates = [0.01, 0.001, 0.005, 0.0001]
+    batch_sizes = [4, 8, 16, 32, 64]
+    dropout_rates = [0.2, 0.3, 0.5]
+    weight_decays = [0, 0.001, 0.0001]
     optimizers = ["Adam"]
     mlcnn_configs = [
         {"name": "MLCNN_large", "num_conv_layers": 4, "hidden_units": 1024},
