@@ -1,5 +1,23 @@
-/Datasets/*
-/models/*
-/plots/*
-/results/*
-/old/*
+# Datasets and generated artifacts
+/Datasets/
+/models/
+/plots/
+/results/
+/old/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environments / IDE
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
